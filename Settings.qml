@@ -23,7 +23,7 @@ SettingsObject {
     property bool pauseOnWindows: true
     SettingMeta on pauseOnWindows {
         label: "Pause when windows are active"
-        description: "Freezes the wallpaper animation when any window is open to save CPU/GPU resources."
+        description: "Freeze while the active workspace has a Hyprland window, then resume on an empty workspace. Applies immediately."
         icon: "pause_circle"
         inputType: SettingMeta.Switch
     }
