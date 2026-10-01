@@ -2,7 +2,7 @@
   "name": "WallpaperEngine",
   "version": "1.0.0",
   "author": "dcqwqc",
-  "homepage": "https://github.com/dcqwqc/caelestia-plugin-wallpaper-engine",
+  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-WallpaperEngine",
   "icon": "wallpaper",
   "description": "Integration with Wallpaper Engine via mpvpaper and linux-wallpaperengine.",
   "entryPoints": [],
