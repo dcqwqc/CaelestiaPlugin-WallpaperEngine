@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import subprocess
+import re
+import signal
+import socket
+import time
+from pathlib import Path
+
+# Shared paths. Steam libraries are deliberately discovered at runtime: both
+# Steam and Workshop content may live outside the default Linux Steam prefix.
+HOME = Path.home()
+CONFIG_FILE = HOME / ".config/caelestia/wpe-config.json"
+WPE_WALLPAPERS_DIR = HOME / "Pictures" / "Wallpapers" / "WallpaperEngine"
+HWDEC_SHIM = HOME / ".local/lib/caelestia-wpe/hwdec-no.so"
+MPVPAPER = HOME / ".local/bin/mpvpaper"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+PAUSE_MONITOR_PID = RUNTIME_DIR / "caelestia-wpe-pause-monitor.pid"
+
+def session_env():
+    """Return an environment that can reach the live Hyprland session.
+
+    The plugin normally inherits this from Caelestia, but user services and
+    remote maintenance shells may not. Recover only the compositor/session
+    variables exported to the user's systemd manager; never synthesize a
+    Hyprland instance signature.
+    """
+    env = os.environ.copy()
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return env
+    try:
+        output = subprocess.check_output(
+            ["systemctl", "--user", "show-environment"], text=True, stderr=subprocess.DEVNULL
+        )
+        allowed = {"HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY"}
+        for line in output.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key in allowed and value:
+                env[key] = value
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return env
+
+def steam_libraries():
+    """Return usable Steam library roots without assuming a host-specific path."""
+    candidates = [
+        HOME / ".local/share/Steam",
+        HOME / ".steam/steam",
+        HOME / ".var/app/com.valvesoftware.Steam/data/Steam",
+    ]
+    for steam_root in list(candidates):
+        library_file = steam_root / "steamapps/libraryfolders.vdf"
+        if not library_file.exists():
+            continue
+        try:
+            # VDF stores library paths as quoted `path` values. This small,
+            # permissive parser avoids adding a VDF dependency to the shell.
+            for value in re.findall(r'"path"\s+"([^"]+)"', library_file.read_text(errors="ignore")):
+                candidates.append(Path(value.replace("\\\\", "\\")))
+        except OSError:
+            pass
+    libraries, seen = [], set()
+    for candidate in candidates:
+        try:
+            candidate = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        if candidate in seen or not (candidate / "steamapps").is_dir():
+            continue
+        seen.add(candidate)
+        libraries.append(candidate)
+    return libraries
+
+def wallpaper_engine_paths():
+    """Find the installed app assets and its Workshop payload, if present."""
+    assets_dirs, workshop_dirs = [], []
+    for library in steam_libraries():
+        assets = library / "steamapps/common/wallpaper_engine/assets"
+        workshop = library / "steamapps/workshop/content/431960"
+        if assets.is_dir():
+            assets_dirs.append(assets)
+        if workshop.is_dir():
+            workshop_dirs.append(workshop)
+    return (assets_dirs[0] if assets_dirs else None,
+            workshop_dirs[0] if workshop_dirs else None)
+
+def load_config():
+    config = {"screens": {}, "fps": 60, "scaling": "fill"}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config.update(json.load(f))
+        except Exception:
+            pass
+    # Read from plugin settings if available
+    plugin_config_file = HOME / ".config/caelestia/plugins.json"
+    if plugin_config_file.exists():
+        try:
+            with open(plugin_config_file, 'r') as f:
+                plugin_data = json.load(f)
+                wpe_settings = plugin_data.get("settings", {}).get("dcqwqc/wallpaperengine", {})
+                if "fps" in wpe_settings: config["fps"] = wpe_settings["fps"]
+                if "scaling" in wpe_settings: config["scaling"] = wpe_settings["scaling"]
+                if "pauseOnWindows" in wpe_settings: config["pause_on_windows"] = wpe_settings["pauseOnWindows"]
+        except Exception:
+            pass
+    return config
+
+def save_config(config):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
+
+def get_active_screens():
+    screens = []
+    try:
+        output = subprocess.check_output(["hyprctl", "monitors"], text=True, env=session_env())
+        for line in output.splitlines():
+            if line.startswith("Monitor "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    screens.append(parts[1])
+    except Exception as e:
+        print(f"Unable to query active Hyprland outputs: {e}", file=sys.stderr)
+    return screens
+
+def set_mpv_paused(screen, paused):
+    """Set libmpv pause state for one output through mpv's IPC socket."""
+    ipc_socket = RUNTIME_DIR / f"caelestia-wpe-{screen}.sock"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(0.2)
+            connection.connect(str(ipc_socket))
+            command = json.dumps({"command": ["set_property", "pause", paused]}) + "\n"
+            connection.sendall(command.encode())
+        return True
+    except (FileNotFoundError, ConnectionError, OSError):
+        return False
+
+def window_coverage_by_output():
+    """Return whether each output's visible workspace contains a window."""
+    try:
+        monitors = json.loads(subprocess.check_output(
+            ["hyprctl", "-j", "monitors"], text=True, stderr=subprocess.DEVNULL, env=session_env()
+        ))
+        clients = json.loads(subprocess.check_output(
+            ["hyprctl", "-j", "clients"], text=True, stderr=subprocess.DEVNULL, env=session_env()
+        ))
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return {}
+
+    coverage = {}
+    for monitor in monitors:
+        monitor_id = monitor.get("id")
+        workspace_id = monitor.get("activeWorkspace", {}).get("id")
+        special_id = monitor.get("specialWorkspace", {}).get("id", 0)
+        coverage[monitor.get("name")] = any(
+            client.get("mapped", False)
+            and not client.get("hidden", False)
+            and client.get("monitor") == monitor_id
+            and (
+                client.get("pinned", False)
+                or client.get("workspace", {}).get("id") == workspace_id
+                or (special_id != 0 and client.get("workspace", {}).get("id") == special_id)
+            )
+            for client in clients
+        )
+    return coverage
+
+def monitor_window_pause():
+    """Apply the plugin toggle and current Hyprland window state continuously."""
+    while True:
+        pause_enabled = bool(load_config().get("pause_on_windows", False))
+        coverage = window_coverage_by_output() if pause_enabled else {}
+        screens = list(coverage) if coverage else get_active_screens()
+        for screen in screens:
+            set_mpv_paused(screen, pause_enabled and coverage.get(screen, False))
+        time.sleep(0.4)
+
+def stop_pause_monitor():
+    try:
+        pid = int(PAUSE_MONITOR_PID.read_text().strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        if b"caelestia-wpe" in cmdline and b"watch-pause" in cmdline:
+            os.kill(pid, signal.SIGTERM)
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError, OSError):
+        pass
+    PAUSE_MONITOR_PID.unlink(missing_ok=True)
+
+def start_pause_monitor():
+    stop_pause_monitor()
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "watch-pause"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    PAUSE_MONITOR_PID.write_text(str(process.pid))
+
+def get_downloaded_wallpapers():
+    wallpapers = {}
+    _, workshop_dir = wallpaper_engine_paths()
+    if workshop_dir is None:
+        return wallpapers
+    for item in workshop_dir.iterdir():
+        if item.is_dir() and item.name.isdigit():
+            proj_json = item / "project.json"
+            title = "Unknown Wallpaper"
+            wtype = "unknown"
+            preview = "preview.jpg"
+            source_file = ""
+            if proj_json.exists():
+                try:
+                    with open(proj_json, 'r') as f:
+                        data = json.load(f)
+                        title = data.get("title", title)
+                        wtype = data.get("type", wtype)
+                        preview = data.get("preview", preview)
+                        source_file = data.get("file", source_file)
+                except Exception:
+                    pass
+            wallpapers[item.name] = {
+                "title": title,
+                "type": wtype,
+                "preview": preview,
+                "file": source_file,
+                "path": str(item)
+            }
+    return wallpapers
+
+def list_wallpapers():
+    wallpapers = get_downloaded_wallpapers()
+    if not wallpapers:
+        print("No downloaded Wallpaper Engine wallpapers found.")
+        _, workshop_dir = wallpaper_engine_paths()
+        print(f"Checked Steam libraries: {', '.join(map(str, steam_libraries())) or '(none found)'}")
+        if workshop_dir is None:
+            print("Wallpaper Engine Workshop content is not installed by Steam on this host.")
+        return
+    
+    print(f"{'Wallpaper ID':<15} | {'Title':<40} | {'Type':<10}")
+    print("-" * 75)
+    for wid, info in sorted(wallpapers.items(), key=lambda x: x[1]['title'].lower()):
+        print(f"{wid:<15} | {info['title'][:40]:<40} | {info['type']:<10}")
+
+def sync_previews():
+    print("Syncing Wallpaper Engine previews to Caelestia wallpapers directory...")
+    wallpapers = get_downloaded_wallpapers()
+    if not wallpapers:
+        print("No wallpapers found to sync.")
+        return
+        
+    WPE_WALLPAPERS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Clear old symlinks
+    for item in WPE_WALLPAPERS_DIR.iterdir():
+        if item.is_symlink() or item.is_file():
+            item.unlink()
+            
+    synced_count = 0
+    for wid, info in wallpapers.items():
+        title_safe = re.sub(r'[\\/*?:"<>| ]', '_', info['title'])
+        preview_file = Path(info['path']) / info['preview']
+        
+        if not preview_file.exists():
+            for name in ["preview.jpg", "preview.png", "preview.gif", "preview.jpeg"]:
+                alt_path = Path(info['path']) / name
+                if alt_path.exists():
+                    preview_file = alt_path
+                    break
+                    
+        if preview_file.exists():
+            ext = preview_file.suffix
+            link_name = f"{title_safe}_{wid}{ext}"
+            link_path = WPE_WALLPAPERS_DIR / link_name
+            try:
+                import shutil
+                shutil.copy2(preview_file, link_path)
+                synced_count += 1
+            except Exception as e:
+                print(f"Failed to copy {link_name}: {e}", file=sys.stderr)
+        else:
+            print(f"No preview file found for: {info['title']} ({wid})", file=sys.stderr)
+            
+    print(f"Successfully synced {synced_count} wallpaper previews to: {WPE_WALLPAPERS_DIR}")
+
+def select_wallpaper_fuzzel():
+    wallpapers = get_downloaded_wallpapers()
+    if not wallpapers:
+        print("No wallpapers found.")
+        return
+        
+    choices = [f"{info['title']} [ID: {wid}]" for wid, info in wallpapers.items()]
+    choices_str = "\n".join(choices)
+    
+    try:
+        proc = subprocess.Popen(
+            ["fuzzel", "-d", "-p", "Select Wallpaper: "],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        stdout, _ = proc.communicate(input=choices_str)
+        selected = stdout.strip()
+        if not selected:
+            return
+            
+        match = re.search(r"\[ID:\s*(\d+)\]", selected)
+        if not match:
+            print("Could not parse selected wallpaper ID.")
+            return
+        wid = match.group(1)
+        
+        set_wallpaper("ask", wid)
+            
+    except Exception as e:
+        print(f"Failed to run fuzzel picker: {e}", file=sys.stderr)
+
+def select_wallpaper_fzf():
+    wallpapers = get_downloaded_wallpapers()
+    if not wallpapers:
+        print("No wallpapers found.")
+        return
+        
+    choices = [f"{info['title']} [ID: {wid}]" for wid, info in wallpapers.items()]
+    choices_str = "\n".join(choices)
+    
+    try:
+        proc = subprocess.Popen(
+            ["fzf", "--prompt=Select Wallpaper: "],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        stdout, _ = proc.communicate(input=choices_str)
+        selected = stdout.strip()
+        if not selected:
+            return
+            
+        match = re.search(r"\[ID:\s*(\d+)\]", selected)
+        if not match:
+            print("Could not parse selected wallpaper ID.")
+            return
+        wid = match.group(1)
+        
+        screens = get_active_screens()
+        screen_choices = ["All Screens"] + screens
+        proc = subprocess.Popen(
+            ["fzf", "--prompt=Apply to screen: "],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        stdout, _ = proc.communicate(input="\n".join(screen_choices))
+        screen = stdout.strip()
+        if not screen:
+            return
+            
+        target = "all" if screen == "All Screens" else screen
+        set_wallpaper(target, wid)
+            
+    except Exception as e:
+        print(f"Failed to run fzf picker: {e}", file=sys.stderr)
+
+def stop_wpe():
+    print("Stopping Wallpaper Engine renderers...")
+    stop_pause_monitor()
+    # Give existing scenes a chance to release their Wayland surfaces before
+    # escalating; SIGKILL caused transient black/backgroundless outputs.
+    subprocess.run(["pkill", "-TERM", "-f", "[l]inux-wallpaperengine"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-TERM", "-x", "mpvpaper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(30):
+        wpe_stopped = subprocess.run(["pgrep", "-f", "[l]inux-wallpaperengine"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        mpvpaper_stopped = subprocess.run(["pgrep", "-x", "mpvpaper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        if wpe_stopped and mpvpaper_stopped:
+            return
+        time.sleep(0.1)
+    subprocess.run(["pkill", "-KILL", "-f", "[l]inux-wallpaperengine"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-KILL", "-x", "mpvpaper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def start_wpe():
+    stop_wpe()
+    
+    current_wp = Path(HOME) / ".local/state/caelestia/wallpaper/current"
+    if current_wp.exists():
+        real_wp = current_wp.resolve()
+        if "steamapps/workshop/content/431960" not in str(real_wp) and "WallpaperEngine" not in str(real_wp):
+            print("Current wallpaper is not a Wallpaper Engine wallpaper. Not starting.", file=sys.stderr)
+            return
+            
+    assets_dir, workshop_dir = wallpaper_engine_paths()
+    if assets_dir is None or workshop_dir is None:
+        print("Error: Wallpaper Engine assets and/or Workshop content are not installed in a discovered Steam library.", file=sys.stderr)
+        print("Install Wallpaper Engine and its subscribed Workshop item through Steam on this host.", file=sys.stderr)
+        return
+        
+    config = load_config()
+    wallpapers = get_downloaded_wallpapers()
+    if not wallpapers:
+        print("No downloaded wallpapers found to start.", file=sys.stderr)
+        return
+        
+    active_screens = get_active_screens()
+    if not active_screens:
+        print("No active Hyprland outputs found; not starting Wallpaper Engine.", file=sys.stderr)
+        return
+    wids = list(wallpapers.keys())
+    
+    # Map screens
+    screen_map = config.get("screens", {})
+    fps = config.get("fps", 60)
+    scaling = config.get("scaling", "fill")
+    
+    print(f"Starting Wallpaper Engine for screens: {', '.join(active_screens)}")
+    
+    for i, screen in enumerate(active_screens):
+        wid = screen_map.get(screen)
+        if not wid or wid not in wallpapers:
+            wid = wids[i % len(wids)]
+            screen_map[screen] = wid
+            
+        wpath = wallpapers[wid]["path"]
+        title = wallpapers[wid]["title"]
+        print(f"  - Screen {screen}: {title} (ID: {wid})")
+        
+        source_file = Path(wpath) / wallpapers[wid].get("file", "")
+        is_plain_video = wallpapers[wid]["type"] == "video" and source_file.is_file()
+
+        if is_plain_video and MPVPAPER.is_file():
+            # linux-wallpaperengine's embedded libmpv path currently produces
+            # a black GL surface with mpv 0.41/FFmpeg 9 on this Intel/Mesa
+            # system. mpvpaper renders ordinary Wallpaper Engine video items
+            # directly while scene/web wallpapers retain the full engine.
+            panscan = "1" if scaling == "fill" else "0"
+            ipc_socket = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"caelestia-wpe-{screen}.sock"
+            ipc_socket.unlink(missing_ok=True)
+            mpv_options = (
+                f"loop-file=inf hwdec=auto panscan={panscan} video-unscaled=no "
+                f"no-audio input-ipc-server={ipc_socket}"
+            )
+            cmd = [
+                str(MPVPAPER),
+                "-l", "background",
+                "-o", mpv_options,
+                screen,
+                str(source_file),
+            ]
+        else:
+            # NOTE: --scaling/--clamp apply to the PRECEDING
+            # --screen-root/--bg output (per linux-wallpaperengine --help).
+            cmd = [
+                "linux-wallpaperengine",
+                "--assets-dir", str(assets_dir),
+                "--fps", str(fps),
+                "--screen-root", screen,
+                "--bg", wpath,
+                "--scaling", scaling,
+                "--clamp", "border",
+            ]
+        
+        try:
+            env = session_env()
+            if not is_plain_video and HWDEC_SHIM.is_file():
+                # The renderer hard-codes hwdec=auto and ignores mpv.conf. On
+                # Intel/Mesa this can select unsupported Vulkan video decode
+                # and produce a live but black layer. Force software decoding
+                # only inside linux-wallpaperengine.
+                preload = env.get("LD_PRELOAD")
+                env["LD_PRELOAD"] = f"{HWDEC_SHIM}:{preload}" if preload else str(HWDEC_SHIM)
+            subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            print(f"Failed to start wallpaper on screen {screen}: {e}", file=sys.stderr)
+            
+    config["screens"] = screen_map
+    save_config(config)
+    start_pause_monitor()
+
+def set_wallpaper(screen, wid):
+    wallpapers = get_downloaded_wallpapers()
+    if wid not in wallpapers:
+        print(f"Error: Wallpaper ID '{wid}' is not downloaded/valid.", file=sys.stderr)
+        return
+        
+    active_screens = get_active_screens()
+    
+    # Handle "ask" screen parameter
+    if screen.lower() == "ask":
+        screen_choices = ["All Screens"] + active_screens
+        try:
+            proc = subprocess.Popen(
+                ["fuzzel", "-d", "-p", "Apply to screen: "],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True
+            )
+            stdout, _ = proc.communicate(input="\n".join(screen_choices))
+            chosen = stdout.strip()
+            if not chosen:
+                print("Operation cancelled by user.")
+                return
+            if chosen == "All Screens":
+                screens_to_set = active_screens
+            else:
+                screens_to_set = [chosen]
+        except Exception as e:
+            print(f"Failed to prompt screen choice: {e}. Defaulting to all active screens.", file=sys.stderr)
+            screens_to_set = active_screens
+    elif screen.lower() == "all":
+        screens_to_set = active_screens
+    else:
+        screens_to_set = [screen]
+        
+    config = load_config()
+    if "screens" not in config:
+        config["screens"] = {}
+        
+    for s in screens_to_set:
+        if s not in active_screens:
+            print(f"Warning: Screen '{s}' is not currently active.")
+        config["screens"][s] = wid
+        
+    save_config(config)
+    
+    # Update config and launch WPE
+    triggered_by_caelestia = os.environ.get("WPE_TRIGGERED_BY_CAELESTIA") == "1"
+    
+    if not triggered_by_caelestia:
+        # Search for a matching preview file to trigger Caelestia's theme engine
+        preview_path = None
+        if WPE_WALLPAPERS_DIR.exists():
+            for item in WPE_WALLPAPERS_DIR.iterdir():
+                if item.is_file() and item.name.endswith(f"_{wid}{item.suffix}"):
+                    preview_path = item
+                    break
+        
+        if preview_path:
+            print(f"Updating Caelestia scheme using preview image: {preview_path.name}")
+            env = os.environ.copy()
+            env["WPE_TRIGGERED_BY_CAELESTIA"] = "1"
+            subprocess.run(["caelestia", "wallpaper", "-f", str(preview_path)], env=env)
+            start_wpe()
+        else:
+            print("No synced preview file found. Launching live wallpaper directly without shell theme sync.")
+            start_wpe()
+    else:
+        start_wpe()
+
+def print_help():
+    print("""Caelestia Wallpaper Engine Control Utility
+
+Usage:
+  caelestia-wpe start                   Start linux-wallpaperengine for all active screens
+  caelestia-wpe stop                    Stop linux-wallpaperengine
+  caelestia-wpe list                    List all downloaded wallpapers from Steam
+  caelestia-wpe sync                    Sync Wallpaper Engine previews to Caelestia wallpapers tab
+  caelestia-wpe set <screen> <id>       Set wallpaper ID for a screen (use "all" for all screens, "ask" to prompt)
+  caelestia-wpe select [--cli]          Fuzzily select wallpaper using fuzzel (default) or fzf
+  caelestia-wpe status                  Check running status
+  caelestia-wpe has <id>                Exit successfully when a Workshop ID is installed
+""")
+
+def check_status():
+    try:
+        output = subprocess.check_output(["pgrep", "-f", "[l]inux-wallpaperengine|[m]pvpaper"], text=True)
+        pids = output.strip().split()
+        print(f"Wallpaper renderer is running (PIDs: {', '.join(pids)})")
+        config = load_config()
+        print("Active configuration:")
+        for screen, wid in config.get("screens", {}).items():
+            print(f"  {screen}: {wid}")
+    except subprocess.CalledProcessError:
+        print("Wallpaper renderer is NOT running.")
+
+def main():
+    with open("/tmp/caelestia-wpe.log", "a") as logfile:
+        logfile.write(f"\n--- RUNNING: {' '.join(sys.argv)} ---\n")
+        
+        # Redirect stdout and stderr to the logfile
+        sys.stdout = logfile
+        sys.stderr = logfile
+        
+        if len(sys.argv) < 2:
+            print_help()
+            sys.exit(1)
+            
+        cmd = sys.argv[1]
+        
+        if cmd == "start":
+            start_wpe()
+        elif cmd == "stop":
+            stop_wpe()
+        elif cmd == "list":
+            list_wallpapers()
+        elif cmd == "sync":
+            sync_previews()
+        elif cmd == "set":
+            if len(sys.argv) < 4:
+                print("Error: Specify both screen and wallpaper ID.", file=sys.stderr)
+                sys.exit(1)
+            set_wallpaper(sys.argv[2], sys.argv[3])
+        elif cmd == "select":
+            if len(sys.argv) > 2 and sys.argv[2] == "--cli":
+                select_wallpaper_fzf()
+            else:
+                select_wallpaper_fuzzel()
+        elif cmd == "status":
+            check_status()
+        elif cmd == "has":
+            if len(sys.argv) < 3:
+                sys.exit(2)
+            sys.exit(0 if sys.argv[2] in get_downloaded_wallpapers() else 1)
+        elif cmd == "watch-pause":
+            monitor_window_pause()
+        else:
+            print_help()
+            sys.exit(1)
+        check_status()
+
+if __name__ == "__main__":
+    main()

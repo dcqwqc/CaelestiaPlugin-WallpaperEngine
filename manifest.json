@@ -1,10 +1,10 @@
 {
   "name": "WallpaperEngine",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "dcqwqc",
   "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-WallpaperEngine",
   "icon": "wallpaper",
-  "description": "Integration with Wallpaper Engine via mpvpaper and linux-wallpaperengine.",
+  "description": "Wallpaper Engine integration via mpvpaper/linux-wallpaperengine with launcher selection, per-screen assignment and lifecycle-safe static/live switching.",
   "entryPoints": [],
   "settings": "Settings.qml"
 }
