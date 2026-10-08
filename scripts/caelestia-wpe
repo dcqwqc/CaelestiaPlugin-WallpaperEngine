@@ -232,6 +232,20 @@ def get_downloaded_wallpapers():
             }
     return wallpapers
 
+def renderer_strategy(info):
+    """Choose supported renderer, including animated fallback for WPE presets."""
+    source = Path(info["path"]) / info.get("file", "")
+    preview = Path(info["path"]) / info.get("preview", "preview.jpg")
+    kind = info.get("type", "unknown")
+    if kind == "video" and source.is_file():
+        return "video", source
+    if kind in ("scene", "web"):
+        return "engine", Path(info["path"])
+    if preview.is_file() and preview.suffix.lower() in (".gif", ".mp4", ".webm"):
+        return "preview_animation", preview
+    return "static_preview", preview
+
+
 def list_wallpapers():
     wallpapers = get_downloaded_wallpapers()
     if not wallpapers:
@@ -427,8 +441,16 @@ def start_wpe():
         title = wallpapers[wid]["title"]
         print(f"  - Screen {screen}: {title} (ID: {wid})")
         
-        source_file = Path(wpath) / wallpapers[wid].get("file", "")
-        is_plain_video = wallpapers[wid]["type"] == "video" and source_file.is_file()
+        strategy, source_file = renderer_strategy(wallpapers[wid])
+        is_plain_video = strategy in ("video", "preview_animation")
+        if strategy == "preview_animation":
+            print(f"  - Unsupported live type for {wid}; using animated preview")
+        if strategy == "static_preview":
+            print(f"  - Unsupported live type for {wid}; using Caelestia static preview")
+            continue
+        if is_plain_video and not MPVPAPER.is_file():
+            print(f"  - mpvpaper missing for {wid}; using Caelestia preview", file=sys.stderr)
+            continue
 
         if is_plain_video and MPVPAPER.is_file():
             # linux-wallpaperengine's embedded libmpv path currently produces
@@ -471,13 +493,19 @@ def start_wpe():
                 # only inside linux-wallpaperengine.
                 preload = env.get("LD_PRELOAD")
                 env["LD_PRELOAD"] = f"{HWDEC_SHIM}:{preload}" if preload else str(HWDEC_SHIM)
-            subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            log_dir = HOME / ".local/state/caelestia/wallpaper-engine"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            safe_screen = re.sub(r"[^A-Za-z0-9_.-]", "_", screen)
+            log_path = log_dir / f"{safe_screen}.log"
+            with log_path.open("w") as log:
+                proc = subprocess.Popen(
+                    cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            time.sleep(0.25)
+            if proc.poll() is not None:
+                detail = log_path.read_text(errors="replace")[-650:].strip()
+                print(f"Wallpaper renderer failed on {screen} (exit {proc.returncode}): {detail}", file=sys.stderr)
         except Exception as e:
             print(f"Failed to start wallpaper on screen {screen}: {e}", file=sys.stderr)
             
