@@ -6,6 +6,5 @@
   "icon": "wallpaper",
   "description": "Wallpaper Engine integration via mpvpaper/linux-wallpaperengine with launcher selection, per-screen assignment and lifecycle-safe static/live switching.",
   "entryPoints": [],
-  "settings": "Settings.qml",
-  "requires": ">=2.1.0"
+  "settings": "Settings.qml"
 }
